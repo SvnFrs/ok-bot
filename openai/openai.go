@@ -1,4 +1,4 @@
-package main
+package openai
 
 import (
 	"context"
@@ -6,10 +6,11 @@ import (
 	"log"
 
 	openai "github.com/sashabaranov/go-openai"
+	"github.com/svnfrs/ok-bot/env"
 )
 
-func chatGPT(message string) string {
-	client := openai.NewClient(getDotEnv("OPEN_AI_KEY"))
+func AskChatGPT(message string) string {
+	client := openai.NewClient(env.GetEnv("OPEN_AI_KEY"))
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{

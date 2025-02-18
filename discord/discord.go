@@ -1,19 +1,21 @@
-package main
+package discord
 
 import (
 	"log"
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/svnfrs/ok-bot/env"
+	"github.com/svnfrs/ok-bot/openai"
 )
 
 var (
-	Token = getDotEnv("DISCORD_BOT_KEY")
+	Token = env.GetEnv("DISCORD_BOT_KEY")
 )
 
 var mu sync.Mutex
 
-func startBot() {
+func StartBot() {
 	dg, err := discordgo.New("Bot " + Token)
 	if err != nil {
 		log.Fatalf("error creating Discord session: %v", err)
@@ -94,7 +96,7 @@ func interactionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		// process the request asynchronously
 		go func() {
 			question := i.ApplicationCommandData().Options[0].StringValue()
-			response := chatGPT(question)
+			response := openai.AskChatGPT(question)
 
 			// edit the original response with the actual content
 			_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
