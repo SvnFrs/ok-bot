@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -9,6 +10,8 @@ import (
 var (
 	Token = getDotEnv("DISCORD_BOT_KEY")
 )
+
+var mu sync.Mutex
 
 func startBot() {
 	dg, err := discordgo.New("Bot " + Token)
@@ -62,7 +65,6 @@ func ready(s *discordgo.Session, event *discordgo.Ready) {
 		}
 	}
 }
-
 func interactionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
@@ -80,18 +82,28 @@ func interactionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			log.Printf("error responding to interaction: %v", err)
 		}
 	case "ask":
-		question := i.ApplicationCommandData().Options[0].StringValue()
-		response := chatGPT(question)
-
+		// acknowledge the interaction immediately
 		err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: response,
-			},
+			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 		})
 		if err != nil {
-			log.Printf("error responding to interaction: %v", err)
+			log.Printf("error deferring response: %v", err)
+			return
 		}
+
+		// process the request asynchronously
+		go func() {
+			question := i.ApplicationCommandData().Options[0].StringValue()
+			response := chatGPT(question)
+
+			// edit the original response with the actual content
+			_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Content: &response,
+			})
+			if err != nil {
+				log.Printf("error editing response: %v", err)
+			}
+		}()
 	}
 }
 
