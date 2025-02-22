@@ -1,7 +1,6 @@
 package discord
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -11,6 +10,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/svnfrs/ok-bot/env"
 	"github.com/svnfrs/ok-bot/openai"
+	"github.com/svnfrs/ok-bot/queue"
 	"github.com/svnfrs/ok-bot/youtube"
 )
 
@@ -18,10 +18,20 @@ var (
 	Token = env.GetEnv("DISCORD_BOT_KEY")
 )
 
+var (
+	musicQueue *queue.MusicQueue
+	currentVC  *discordgo.VoiceConnection
+	queueMutex sync.Mutex
+)
+
 var mu sync.Mutex
 
 func ptr(s string) *string {
 	return &s
+}
+
+func init() {
+	musicQueue = queue.NewMusicQueue()
 }
 
 func StartBot() {
@@ -52,6 +62,10 @@ func ready(s *discordgo.Session, event *discordgo.Ready) {
 
 	commands := []*discordgo.ApplicationCommand{
 		{
+			Name:        "ok",
+			Description: "List current commands",
+		},
+		{
 			Name:        "ping",
 			Description: "Replies with Pong!",
 		},
@@ -80,6 +94,22 @@ func ready(s *discordgo.Session, event *discordgo.Ready) {
 			},
 		},
 		{
+			Name:        "queue",
+			Description: "Show the current music queue",
+		},
+		{
+			Name:        "skip",
+			Description: "Skip the current song",
+		},
+		{
+			Name:        "stop",
+			Description: "Stop the current song",
+		},
+		{
+			Name:        "resume",
+			Description: "Resume the current song",
+		},
+		{
 			Name:        "disconnect",
 			Description: "Disconnects the bot from the voice channel",
 		},
@@ -98,6 +128,27 @@ func interactionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}
 
 	switch i.ApplicationCommandData().Name {
+	case "ok":
+		commandList := `Available Commands:
+/ok - Show this list of commands
+/ping - Check if bot is responsive
+/ask [question] - Ask ChatGPT a question
+/youtube [url] - Play audio from a YouTube video
+/queue - Show the current music queue
+/skip - Skip the current song
+/stop - Pause the current playback
+/resume - Resume paused playback
+/disconnect - Disconnect bot from voice channel`
+
+		err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: commandList,
+			},
+		})
+		if err != nil {
+			log.Printf("error responding to interaction: %v", err)
+		}
 	case "ping":
 		err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -183,108 +234,235 @@ func interactionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			return
 		}
 
-		// Join the voice channel
-		voiceConnection, err := s.ChannelVoiceJoin(
-			i.GuildID,                // Guild ID
-			userVoiceState.ChannelID, // Channel ID
-			false,                    // Self mute
-			false,                    // Self deaf
-		)
-		if err != nil {
+		queueMutex.Lock()
+		if currentVC == nil {
+			// Join the voice channel if not already connected
+			currentVC, err = s.ChannelVoiceJoin(
+				i.GuildID,
+				userVoiceState.ChannelID,
+				false,
+				false,
+			)
+			if err != nil {
+				queueMutex.Unlock()
+				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Content: ptr(fmt.Sprintf("Error joining voice channel: %v", err)),
+				})
+				return
+			}
+		}
+		queueMutex.Unlock()
+
+		// Add the song to the queue
+		musicQueue.Add(queue.Song{
+			URL:      url,
+			Filename: filename,
+		})
+
+		// Start playing if nothing is currently playing
+		if !musicQueue.IsPlaying() {
+			go playNextSong(s, i.GuildID, i.ChannelID)
 			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Content: ptr(fmt.Sprintf("Error joining voice channel: %v", err)),
+				Content: ptr("Now playing audio..."),
+			})
+		} else {
+			// If something is playing, inform that it was added to queue
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Content: ptr("Added to queue! Use /queue to see the current queue."),
+			})
+		}
+
+	case "queue":
+		songs := musicQueue.List()
+		if len(songs) == 0 {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "The queue is empty!",
+				},
 			})
 			return
 		}
 
-		// Update message to show we're playing
-		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Content: ptr("Now playing audio..."),
+		content := "Current queue:\n"
+		for idx, song := range songs {
+			content += fmt.Sprintf("%d. %s\n", idx+1, song.URL)
+		}
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: content,
+			},
 		})
 
-		// Create a done channel to signal when we're done playing
-		done := make(chan bool)
+	case "skip":
+		if !musicQueue.IsPlaying() {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Nothing is playing!",
+				},
+			})
+			return
+		}
 
-		// Play the audio file
-		go func() {
-			defer func() {
-				if voiceConnection != nil {
-					voiceConnection.Disconnect()
+		musicQueue.Stop()
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Skipped!",
+			},
+		})
+
+	case "stop":
+		if !musicQueue.IsPlaying() {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Nothing is playing!",
+				},
+			})
+			return
+		}
+
+		musicQueue.Stop()
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Playback paused!",
+			},
+		})
+
+	// Update the resume case in interactionCreate
+	case "resume":
+		if !musicQueue.IsPaused() {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Playback is not paused!",
+				},
+			})
+			return
+		}
+
+		musicQueue.Resume()
+		go playNextSong(s, i.GuildID, i.ChannelID)
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Playback resumed!",
+			},
+		})
+
+	// Update the disconnect case in interactionCreate
+	case "disconnect":
+		queueMutex.Lock()
+		if currentVC != nil {
+			musicQueue.Stop()
+			musicQueue.Clear()
+			err := currentVC.Disconnect()
+			currentVC = nil
+			queueMutex.Unlock()
+
+			if err != nil {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "Error disconnecting from voice channel!",
+					},
+				})
+				return
+			}
+
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Disconnected from voice channel!",
+				},
+			})
+			return
+		}
+		queueMutex.Unlock()
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Not connected to a voice channel!",
+			},
+		})
+	}
+}
+
+func playNextSong(s *discordgo.Session, guildID string, channelID string) {
+	for {
+		if musicQueue.IsPaused() {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		if !musicQueue.IsPlaying() {
+			var song queue.Song
+			var ok bool
+
+			// If there's no current song, get the next one from queue
+			if currentSong := musicQueue.GetCurrentSong(); currentSong == nil {
+				song, ok = musicQueue.Next()
+				if !ok {
+					return
+				}
+				musicQueue.SetCurrentSong(&song)
+			} else {
+				// Resume playing the current song
+				song = *currentSong
+				ok = true
+			}
+
+			musicQueue.SetPlaying(true)
+			done := make(chan bool)
+
+			// Ensure voice connection is still valid
+			if currentVC == nil || currentVC.Ready == false {
+				var err error
+				// Get the voice channel ID from the guild
+				guild, _ := s.State.Guild(guildID)
+				var channelID string
+				for _, vs := range guild.VoiceStates {
+					if vs.UserID == s.State.User.ID {
+						channelID = vs.ChannelID
+						break
+					}
+				}
+
+				if channelID != "" {
+					currentVC, err = s.ChannelVoiceJoin(guildID, channelID, false, false)
+					if err != nil {
+						log.Printf("Error rejoining voice channel: %v", err)
+						return
+					}
+					// Wait for connection to be ready
+					time.Sleep(time.Second)
+				}
+			}
+
+			go func() {
+				dgvoice.PlayAudioFile(currentVC, song.Filename, done)
+				<-done
+				musicQueue.SetPlaying(false)
+				musicQueue.SetCurrentSong(nil)
+				if !musicQueue.IsPaused() {
+					go playNextSong(s, guildID, channelID)
 				}
 			}()
 
-			// Add timeout context
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
-
-			done := make(chan bool)
-			go func() {
-				dgvoice.PlayAudioFile(voiceConnection, filename, done)
-				close(done)
-			}()
-
 			select {
-			case <-done:
-				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-					Content: ptr("Finished playing the audio!"),
-				})
-			case <-ctx.Done():
-				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-					Content: ptr("Playback timed out!"),
-				})
+			case <-musicQueue.Done:
+				close(done)
+				return
 			}
-		}()
-
-		// Wait for the audio to finish playing
-		<-done
-
-		// Update the message once we're done
-		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Content: ptr("Finished playing the audio!"),
-		})
-
-	case "disconnect":
-		// Find the voice connection for this guild
-		voiceConnection, ok := s.VoiceConnections[i.GuildID]
-		if !ok {
-			err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: "I'm not in a voice channel!",
-				},
-			})
-			if err != nil {
-				log.Printf("Error responding to interaction: %v", err)
-			}
-			return
 		}
-
-		// Disconnect from the voice channel
-		err := voiceConnection.Disconnect()
-		if err != nil {
-			log.Printf("Error disconnecting from voice channel: %v", err)
-			err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: "Failed to disconnect from voice channel!",
-				},
-			})
-			if err != nil {
-				log.Printf("Error responding to interaction: %v", err)
-			}
-			return
-		}
-
-		// Respond to confirm disconnection
-		err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: "Successfully disconnected from voice channel!",
-			},
-		})
-		if err != nil {
-			log.Printf("Error responding to interaction: %v", err)
-		}
+		time.Sleep(time.Second)
 	}
 }
 
